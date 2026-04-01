@@ -168,9 +168,10 @@ fn build_provider(
         }
         "ollama" => {
             let model = model.unwrap_or_else(|| "qwen3.5:9b".into());
-            let url = base_url.as_deref().unwrap_or(ollama_url);
+            let raw_url = base_url.as_deref().unwrap_or(ollama_url);
+            let url = ensure_openai_v1(raw_url);
             eprintln!("Using Ollama (url: {}, model: {})", url, model);
-            let mut p = claw_provider::openai_compat::OpenAICompatProvider::new(url);
+            let mut p = claw_provider::openai_compat::OpenAICompatProvider::new(&url);
             if let Some(ref key) = api_key {
                 p = p.with_api_key(key);
             }
@@ -180,7 +181,8 @@ fn build_provider(
             })
         }
         "openai" => {
-            let url = base_url.unwrap_or_else(|| "https://api.openai.com".into());
+            let raw_url = base_url.unwrap_or_else(|| "https://api.openai.com".into());
+            let url = ensure_openai_v1(&raw_url);
             let model = model.unwrap_or_else(|| "gpt-4o".into());
             eprintln!("Using OpenAI-compat (url: {}, model: {})", url, model);
             let mut p = claw_provider::openai_compat::OpenAICompatProvider::new(&url);
@@ -197,6 +199,107 @@ fn build_provider(
                 "Unknown provider '{}'. Use: anthropic, ollama, openai",
                 other
             );
+        }
+    }
+}
+
+/// async-openai appends `/chat/completions` to the base URL, so Ollama/OpenAI
+/// endpoints need a `/v1` suffix. Append it if missing.
+fn ensure_openai_v1(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        trimmed.to_string()
+    } else {
+        format!("{}/v1", trimmed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ollama availability check + auto-start
+// ---------------------------------------------------------------------------
+
+/// Parse host and port from an Ollama URL (e.g. "http://localhost:11434").
+fn parse_ollama_addr(url: &str) -> (String, u16) {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let without_path = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if let Some((host, port_str)) = without_path.rsplit_once(':') {
+        let port = port_str.parse().unwrap_or(11434);
+        (host.to_string(), port)
+    } else {
+        (without_path.to_string(), 11434)
+    }
+}
+
+/// Check if Ollama is listening on the given URL.
+fn is_ollama_reachable(url: &str) -> bool {
+    let (host, port) = parse_ollama_addr(url);
+    let addr = format!("{}:{}", host, port);
+    std::net::TcpStream::connect_timeout(
+        &addr
+            .parse()
+            .unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+        std::time::Duration::from_secs(2),
+    )
+    .is_ok()
+}
+
+/// Ensure Ollama is running. If not, offer to start it (interactive mode)
+/// or return an error (non-interactive).
+pub fn ensure_ollama(url: &str, interactive: bool) -> Result<()> {
+    if is_ollama_reachable(url) {
+        return Ok(());
+    }
+
+    if !interactive {
+        anyhow::bail!(
+            "Ollama is not running at {}. Start it with `ollama serve` and try again.",
+            url
+        );
+    }
+
+    eprint!(
+        "Ollama is not running at {}. Start it automatically? [Y/n] ",
+        url
+    );
+    std::io::Write::flush(&mut std::io::stderr())?;
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_lowercase();
+    if !answer.is_empty() && answer != "y" && answer != "yes" {
+        anyhow::bail!("Ollama is required. Start it with `ollama serve` and try again.");
+    }
+
+    eprintln!("Starting Ollama...");
+    let child = std::process::Command::new("ollama")
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+
+    match child {
+        Ok(_) => {
+            // Wait for Ollama to become available (up to 15 seconds)
+            for i in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if is_ollama_reachable(url) {
+                    eprintln!("Ollama is ready. (took ~{}s)", (i + 1) / 2);
+                    return Ok(());
+                }
+            }
+            anyhow::bail!("Ollama was started but did not become reachable within 15 seconds.")
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "Could not find `ollama` in PATH. \
+                 Install it from https://ollama.com and try again."
+            )
+        }
+        Err(e) => {
+            anyhow::bail!("Failed to start Ollama: {}", e)
         }
     }
 }

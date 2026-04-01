@@ -112,6 +112,11 @@ async fn main() -> Result<()> {
     let registry = Arc::new(registry);
     let orchestrator = ToolOrchestrator::new(Arc::clone(&registry));
 
+    // If provider is ollama (explicit or will be auto-detected), check availability
+    if cli.provider.as_deref() == Some("ollama") {
+        config::ensure_ollama(&cli.ollama_url, interactive)?;
+    }
+
     // Resolve provider: CLI flags > env vars > config file > onboarding
     let resolved = config::resolve_provider(
         cli.provider.as_deref(),
